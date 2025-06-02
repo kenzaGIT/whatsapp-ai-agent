@@ -1,0 +1,349 @@
+#main.py
+import os
+import asyncio
+import json
+import sys
+from fastapi import FastAPI, Form, Request, Response
+from fastapi.responses import PlainTextResponse
+from dotenv import load_dotenv
+from typing import Dict, Any, List, Tuple
+from datetime import datetime, timedelta
+
+# Add the current directory to the path so we can import our modules
+sys.path.append(".")
+
+# Import components
+from agent.llm import LLMService
+from agent.reasoning import ChainOfThoughtReasoner
+from agent.action_planner import ActionPlanner, ActionPlan, Action
+from connectors.whatsapp import TwilioWhatsAppConnector
+from connectors.calendar_api import GoogleCalendarConnector
+from connectors.email_api import EmailService
+from utils.message_parser import MessageParser
+from utils.time_utils import TimeConverter
+
+# Load environment variables
+load_dotenv()
+
+# Initialize LLM service
+llm_service = LLMService()
+
+# Initialize reasoning and message parser
+reasoner = ChainOfThoughtReasoner(llm_service)
+message_parser = MessageParser(llm_service)
+
+# Initialize WhatsApp connector
+whatsapp = TwilioWhatsAppConnector()
+
+# Initialize the calendar connector
+calendar = GoogleCalendarConnector(
+    credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH"),
+    default_calendar_id=os.getenv("GOOGLE_CALENDAR_ID")
+)
+
+# Initialize the email service
+email = None
+if os.getenv("EMAIL_SMTP_SERVER") and os.getenv("EMAIL_ADDRESS") and os.getenv("EMAIL_PASSWORD"):
+    email = EmailService(
+        smtp_server=os.getenv("EMAIL_SMTP_SERVER"),
+        smtp_port=int(os.getenv("EMAIL_SMTP_PORT", "587")),
+        email=os.getenv("EMAIL_ADDRESS"),
+        password=os.getenv("EMAIL_PASSWORD")
+    )
+
+# Initialize action planner with available services
+available_services = {"calendar": calendar}
+if email:
+    available_services["email"] = email
+
+action_planner = ActionPlanner(
+    llm_service=llm_service,
+    reasoner=reasoner,
+    available_services=available_services
+)
+
+# Create FastAPI app
+app = FastAPI()
+
+# Conversation state for user verification
+conversation_state = {}
+
+# Root endpoint for health check
+@app.get("/")
+async def root():
+    return {"status": "WhatsApp AI Agent webhook is running", "services": list(available_services.keys())}
+
+# Webhook endpoint for WhatsApp messages
+@app.post("/webhook", response_class=PlainTextResponse)
+async def webhook_handler(
+    request: Request,
+    From: str = Form(...),
+    Body: str = Form(...),
+    NumMedia: int = Form(0),
+):
+    """Handle incoming WhatsApp messages via Twilio webhook"""
+    print(f"Received message from {From}: {Body}")
+    
+    # Extract the user's phone number
+    sender_id = From
+    message_text = Body
+    
+    # Create a task to process the message asynchronously
+    # This allows us to return a response to Twilio quickly
+    asyncio.create_task(process_message(sender_id, message_text))
+    
+    # Return empty TwiML response
+    return whatsapp.create_response_twiml()
+
+async def process_message(sender_id: str, message_text: str):
+    """Process an incoming WhatsApp message"""
+    # Check if this is a verification response
+    if sender_id in conversation_state and conversation_state[sender_id].get("awaiting_verification"):
+        await handle_verification_response(sender_id, message_text)
+        return
+    
+    try:
+        # Send a "thinking" message
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="🤔 Thinking about your request..."
+        )
+        
+        # 1. Parse the message to understand intent
+        intent = await message_parser.parse(message_text)
+        print(f"Parsed intent: {json.dumps(intent, indent=2)}")
+        
+        # 2. Execute chain-of-thought reasoning
+        reasoning_steps = await reasoner.reason(
+            prompt=message_text,
+            intent=intent,
+            context={"sender_id": sender_id}
+        )
+        print(f"Reasoning steps: {json.dumps(reasoning_steps, indent=2)}")
+        
+        # 3. Plan actions based on reasoning
+        action_plan = await action_planner.plan(
+            intent=intent,
+            reasoning=reasoning_steps
+        )
+        print(f"Action plan: {action_plan.summary}")
+        print(f"Requires verification: {action_plan.requires_verification}")
+        
+        # 4. Execute action plan or request verification
+        if action_plan.requires_verification:
+            # Save the plan for later execution
+            conversation_state[sender_id] = {
+                "awaiting_verification": True,
+                "pending_action": action_plan
+            }
+            
+            verification_message = (
+                f"I'll help you with this. Here's what I'm planning to do:\n\n"
+                f"{action_plan.summary}\n\n"
+                f"Would you like me to proceed? (yes/no)"
+            )
+            
+            await whatsapp.send_message(
+                recipient_id=sender_id,
+                message=verification_message
+            )
+        else:
+            # Execute immediately
+            response = await execute_action_plan(action_plan, sender_id)
+            await whatsapp.send_message(
+                recipient_id=sender_id,
+                message=response
+            )
+            
+    except Exception as e:
+        print(f"Error processing message: {str(e)}")
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message=f"I encountered an error while processing your request: {str(e)}\n\nPlease try again with a different request."
+        )
+
+async def handle_verification_response(sender_id: str, message_text: str):
+    """Handle a user's response to a verification request"""
+    state = conversation_state[sender_id]
+    
+    if message_text.lower() in ["yes", "oui", "y", "sure", "ok", "👍"]:
+        # Execute the pending action
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="Processing your request now..."
+        )
+        
+        # Execute actions and send response
+        response = await execute_action_plan(state["pending_action"], sender_id)
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message=response
+        )
+        
+        # Clear state
+        conversation_state[sender_id] = {"awaiting_verification": False}
+        
+    elif message_text.lower() in ["no", "non", "n", "cancel", "👎"]:
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="Action cancelled. How else can I help you?"
+        )
+        # Clear state
+        conversation_state[sender_id] = {"awaiting_verification": False}
+    else:
+        # Unclear response
+        await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="I'm not sure if that's a yes or a no. Please respond with 'yes' or 'no'."
+        )
+
+async def execute_action_plan(action_plan, sender_id: str) -> str:
+    """Execute the action plan and return a response"""
+    results = []
+    
+    # Check for any calendar creation actions that might have conflicts
+    calendar_create_actions = [
+        action for action in action_plan.actions 
+        if action.service == "calendar" and action.method == "create_event"
+    ]
+    
+    # Flag for tracking if we encountered any conflicts
+    encountered_conflicts = False
+    
+    # Process each action
+    for action in action_plan.actions:
+        service_name = action.service
+        service = action_planner.available_services.get(service_name)
+        
+        if service:
+            try:
+                # For calendar creation, ensure we have proper time formats
+                if service_name == "calendar" and action.method == "create_event":
+                    # Make sure times are in proper ISO format with timezone
+                    if "start_time" in action.params and "end_time" in action.params:
+                        start_time = action.params["start_time"]
+                        end_time = action.params["end_time"]
+                        start_time, end_time = service._ensure_iso_format(start_time, end_time)
+                        action.params["start_time"] = start_time
+                        action.params["end_time"] = end_time
+                
+                print(f"Executing {service_name}.{action.method} with params: {json.dumps(action.params, indent=2)}")
+                
+                result = await service.execute(
+                    method=action.method,
+                    params=action.params
+                )
+                
+                print(f"Action result: {json.dumps(result, indent=2)}")
+                
+                # Check specifically for calendar conflicts
+                if (service_name == "calendar" and 
+                    action.method == "create_event" and 
+                    result.get("status") == "conflict"):
+                    encountered_conflicts = True
+                
+                results.append(result)
+            except Exception as e:
+                error_msg = f"Error with {service_name}: {str(e)}"
+                print(error_msg)
+                results.append({"error": error_msg})
+        else:
+            results.append({"error": f"Service {service_name} not available"})
+    
+    # Generate a human-friendly response based on the results
+    if encountered_conflicts:
+        # Use enhanced response generation for conflicts
+        response = await action_planner.generate_response_with_conflicts(
+            action_plan=action_plan,
+            results=results
+        )
+    else:
+        # Use standard response generation
+        response = await action_planner.generate_response(
+            action_plan=action_plan,
+            results=results
+        )
+    
+    return response
+
+# Special handler for rescheduling when conflicts found
+async def handle_reschedule(sender_id: str, message_text: str, suggested_times: List[Tuple[str, str]]):
+    """Handle user response to a conflict resolution with rescheduling"""
+    # Parse the user response to determine which alternative time they want
+    choice = 0
+    for i in range(1, len(suggested_times) + 1):
+        if f"{i}" in message_text or f"option {i}" in message_text.lower():
+            choice = i - 1
+            break
+    
+    if choice < 0 or choice >= len(suggested_times):
+        return await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="I'm not sure which time option you prefer. Please specify Option 1, 2, or 3."
+        )
+    
+    # Get the selected time
+    start_time, end_time = suggested_times[choice]
+    
+    # Retrieve the original action plan
+    if sender_id not in conversation_state or "original_action" not in conversation_state[sender_id]:
+        return await whatsapp.send_message(
+            recipient_id=sender_id,
+            message="I'm sorry, but I don't have your original event details anymore. Please start over with a new request."
+        )
+    
+    # Update the action with the new time
+    original_action = conversation_state[sender_id]["original_action"]
+    original_action.params["start_time"] = start_time
+    original_action.params["end_time"] = end_time
+    
+    # Execute the updated action
+    try:
+        service = action_planner.available_services.get(original_action.service)
+        result = await service.execute(
+            method=original_action.method,
+            params=original_action.params
+        )
+        
+        # Generate response
+        if result.get("status") == "success":
+            time_range = TimeConverter.format_time_range(start_time, end_time)
+            response = f"✅ I've rescheduled your event to {time_range}! Here are the details:\n\n" \
+                      f"*{original_action.params.get('summary', 'Event')}*\n" \
+                      f"Date: {datetime.fromisoformat(start_time.replace('Z', '+00:00')).strftime('%A, %B %d, %Y')}\n" \
+                      f"Time: {time_range}\n"
+            
+            if "location" in original_action.params and original_action.params["location"]:
+                response += f"Location: {original_action.params['location']}\n"
+                
+            response += "\nIs there anything else you'd like me to help with?"
+        else:
+            response = f"I'm sorry, but I encountered an issue while rescheduling your event: {result.get('message', 'Unknown error')}"
+    
+    except Exception as e:
+        response = f"I'm sorry, but I encountered an error while rescheduling your event: {str(e)}"
+    
+    # Send the response
+    await whatsapp.send_message(
+        recipient_id=sender_id,
+        message=response
+    )
+    
+    # Clear the conversation state
+    conversation_state[sender_id] = {"awaiting_verification": False}
+
+# Main entry point
+if __name__ == "__main__":
+    import uvicorn
+    from datetime import datetime, timedelta
+    from typing import List, Tuple
+    
+    print("Starting full WhatsApp AI Agent with:")
+    print(f"- LLM: {llm_service.model}")
+    print(f"- Services: {', '.join(available_services.keys())}")
+    
+    # Get port from environment or use default
+    port = int(os.getenv("PORT", "8000"))
+    
+    # Run the server
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

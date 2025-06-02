@@ -1,0 +1,249 @@
+# utils/time_utils.py
+from datetime import datetime, timedelta
+from typing import Tuple, Optional
+import re
+import pytz
+
+class TimeConverter:
+    """Utility class for handling time conversion and formatting for calendar operations"""
+    
+    # Time zone for Casablanca/Morocco
+    TIMEZONE = pytz.timezone('Africa/Casablanca')
+    
+    @staticmethod
+    def natural_time_to_iso(date_str: str, time_str: str, duration_minutes: int = 60) -> Tuple[str, str]:
+        """
+        Convert natural language date and time to ISO format
+        
+        Args:
+            date_str: Natural language date (e.g., 'tomorrow', 'next Monday')
+            time_str: Natural language time (e.g., '3pm', '15:30')
+            duration_minutes: Duration in minutes (default: 60)
+            
+        Returns:
+            Tuple of (start_time_iso, end_time_iso)
+        """
+        now = datetime.now(TimeConverter.TIMEZONE)
+        
+        # Handle date
+        if date_str.lower() == 'today':
+            target_date = now.date()
+        elif date_str.lower() == 'tomorrow':
+            target_date = (now + timedelta(days=1)).date()
+        elif date_str.lower() in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
+            # Map day names to weekday values (0=Monday, 6=Sunday)
+            day_map = {
+                'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+                'friday': 4, 'saturday': 5, 'sunday': 6
+            }
+            target_day = day_map[date_str.lower()]
+            current_day = now.weekday()
+            days_ahead = (target_day - current_day) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # Next week if the day is today
+            target_date = (now + timedelta(days=days_ahead)).date()
+        else:
+            # Try to parse as direct date format (e.g., MM/DD/YYYY)
+            try:
+                date_formats = ['%m/%d/%Y', '%m/%d', '%Y-%m-%d', '%d %b', '%b %d']
+                parsed_date = None
+                
+                for fmt in date_formats:
+                    try:
+                        parsed_date = datetime.strptime(date_str, fmt).date()
+                        if '%Y' not in fmt:  # If no year specified, use current year
+                            parsed_date = parsed_date.replace(year=now.year)
+                        break
+                    except ValueError:
+                        continue
+                        
+                if parsed_date:
+                    target_date = parsed_date
+                else:
+                    # Default to today if parsing fails
+                    target_date = now.date()
+            except:
+                # Default to today if anything fails
+                target_date = now.date()
+        
+        # Handle time
+        hour = 0
+        minute = 0
+        
+        # Try to parse common time formats
+        if re.match(r'^\d{1,2}(:\d{2})?\s*(am|pm)$', time_str, re.IGNORECASE):
+            # Format like "3pm" or "3:30pm"
+            parts = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$', time_str, re.IGNORECASE)
+            hour = int(parts.group(1))
+            minute = int(parts.group(2) or 0)
+            if parts.group(3).lower() == 'pm' and hour < 12:
+                hour += 12
+            if parts.group(3).lower() == 'am' and hour == 12:
+                hour = 0
+        elif re.match(r'^\d{1,2}:\d{2}$', time_str):
+            # Format like "15:30"
+            parts = time_str.split(':')
+            hour = int(parts[0])
+            minute = int(parts[1])
+        elif time_str.lower() == 'noon':
+            hour = 12
+            minute = 0
+        elif time_str.lower() == 'midnight':
+            hour = 0
+            minute = 0
+        elif time_str.lower() == 'morning':
+            hour = 9
+            minute = 0
+        elif time_str.lower() == 'afternoon':
+            hour = 14
+            minute = 0
+        elif time_str.lower() == 'evening':
+            hour = 18
+            minute = 0
+        else:
+            # Default to current hour if parsing fails
+            hour = now.hour
+            minute = 0
+        
+        # Create datetime objects for start and end
+        start_datetime = datetime.combine(target_date, datetime.min.time().replace(hour=hour, minute=minute))
+        start_datetime = TimeConverter.TIMEZONE.localize(start_datetime)
+        end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+        
+        # Format as ISO 8601 with timezone information
+        start_iso = start_datetime.isoformat()
+        end_iso = end_datetime.isoformat()
+        
+        return start_iso, end_iso
+    
+    @staticmethod
+    def parse_duration(duration_str: str) -> int:
+        """
+        Parse a duration string into minutes
+        
+        Args:
+            duration_str: Duration string (e.g., '1 hour', '30 minutes')
+            
+        Returns:
+            Duration in minutes
+        """
+        # Default duration (1 hour)
+        default_minutes = 60
+        
+        if not duration_str:
+            return default_minutes
+            
+        # Try to parse hour or minute duration
+        hour_match = re.search(r'(\d+)\s*(?:hour|hr)s?', duration_str, re.IGNORECASE)
+        minute_match = re.search(r'(\d+)\s*(?:min|minute)s?', duration_str, re.IGNORECASE)
+        
+        minutes = 0
+        
+        if hour_match:
+            minutes += int(hour_match.group(1)) * 60
+            
+        if minute_match:
+            minutes += int(minute_match.group(1))
+            
+        return minutes if minutes > 0 else default_minutes
+        
+    @staticmethod
+    def format_time_range(start_iso: str, end_iso: str) -> str:
+        """
+        Format ISO datetime strings to a human-readable time range
+        
+        Args:
+            start_iso: Start time in ISO format
+            end_iso: End time in ISO format
+            
+        Returns:
+            Human-readable time range (e.g., "3:00 PM to 4:00 PM")
+        """
+        try:
+            start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+            
+            # Format with locale-aware time
+            start_str = start_dt.strftime("%I:%M %p").lstrip('0')
+            end_str = end_dt.strftime("%I:%M %p").lstrip('0')
+            
+            return f"{start_str} to {end_str}"
+        except:
+            # Fallback for parsing errors
+            return f"{start_iso} to {end_iso}"
+            
+    @staticmethod
+    def get_alternate_time_suggestions(start_iso: str, end_iso: str, conflicts: list) -> list:
+        """
+        Generate alternative time suggestions based on conflicts
+        
+        Args:
+            start_iso: Original start time in ISO format
+            end_iso: Original end time in ISO format
+            conflicts: List of conflicting events
+            
+        Returns:
+            List of alternative time slots as (start_iso, end_iso) tuples
+        """
+        try:
+            start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+            duration = (end_dt - start_dt).total_seconds() / 60  # Duration in minutes
+            
+            # Gather all conflict times
+            conflict_times = []
+            for conflict in conflicts:
+                conflict_start = datetime.fromisoformat(conflict['start'].replace('Z', '+00:00'))
+                conflict_end = datetime.fromisoformat(conflict['end'].replace('Z', '+00:00'))
+                conflict_times.append((conflict_start, conflict_end))
+            
+            # Sort conflicts by start time
+            conflict_times.sort(key=lambda x: x[0])
+            
+            # Generate suggestions
+            suggestions = []
+            
+            # 1. Earlier same day
+            if start_dt.hour > 9:  # If the requested time is after 9am
+                early_start = start_dt.replace(hour=9, minute=0)
+                early_end = early_start + timedelta(minutes=duration)
+                
+                # Check if this conflicts with anything
+                if not any(c[0] <= early_end and c[1] >= early_start for c in conflict_times):
+                    suggestions.append((early_start.isoformat(), early_end.isoformat()))
+            
+            # 2. Later same day
+            if end_dt.hour < 17:  # If the requested end time is before 5pm
+                late_start = end_dt.replace(hour=17, minute=0)
+                late_end = late_start + timedelta(minutes=duration)
+                
+                # Check if this conflicts with anything
+                if not any(c[0] <= late_end and c[1] >= late_start for c in conflict_times):
+                    suggestions.append((late_start.isoformat(), late_end.isoformat()))
+            
+            # 3. Next day, same time
+            next_day_start = start_dt + timedelta(days=1)
+            next_day_end = end_dt + timedelta(days=1)
+            suggestions.append((next_day_start.isoformat(), next_day_end.isoformat()))
+            
+            # 4. Gaps between conflicts on the same day
+            if len(conflict_times) > 1:
+                for i in range(len(conflict_times) - 1):
+                    gap_start = conflict_times[i][1]
+                    gap_end = conflict_times[i+1][0]
+                    
+                    # If the gap is large enough for our event
+                    gap_minutes = (gap_end - gap_start).total_seconds() / 60
+                    if gap_minutes >= duration:
+                        gap_event_start = gap_start
+                        gap_event_end = gap_start + timedelta(minutes=duration)
+                        suggestions.append((gap_event_start.isoformat(), gap_event_end.isoformat()))
+            
+            return suggestions
+        except:
+            # Fallback for any errors - just suggest next day
+            start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+            next_day_start = (start_dt + timedelta(days=1)).isoformat()
+            next_day_end = (end_dt + timedelta(days=1)).isoformat()
+            return [(next_day_start, next_day_end)]
